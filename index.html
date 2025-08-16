@@ -1,0 +1,273 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Nova Voice - Behram Reception</title>
+  <style>
+    :root {
+      --bg1: #0b1020; --bg2: #0d1633; --card: #0f1b45; --card-border: #1b2450;
+      --text: #eaf2ff; --muted: #a9b8d9;
+      --blue1: #2563eb; --blue2: #60a5fa; --red1: #ef4444; --red2: #fb7185;
+      --glow: rgba(96,165,250,.55);
+    }
+    html, body { height: 100%; }
+    body {
+      margin: 0; color: var(--text); font-family: ui-sans-serif, system-ui, Segoe UI, Roboto, Arial;
+      background: radial-gradient(1000px 600px at 20% 10%, #0f1b45 0%, transparent 60%),
+                  radial-gradient(800px 500px at 80% 0%, #0b2a6f 0%, transparent 65%),
+                  linear-gradient(180deg, var(--bg1), var(--bg2));
+      display: grid; place-items: center;
+    }
+    .shell { width: 100%; max-width: 980px; padding: 32px 20px; }
+    .hero { display: grid; place-items: center; gap: 18px; margin: 40px 0 18px; }
+    .title { font-size: 20px; letter-spacing: .6px; opacity: .85; }
+
+    .call-btn {
+      appearance: none; border: 0; cursor: pointer; font-weight: 800; letter-spacing: .4px;
+      padding: 22px 34px; border-radius: 999px; color: white; font-size: 20px;
+      background: radial-gradient(140% 100% at 0% 0%, var(--blue2), var(--blue1));
+      box-shadow: 0 10px 30px var(--glow), inset 0 0 20px rgba(255,255,255,.05);
+      transition: transform .08s ease, box-shadow .2s ease, background .3s ease, filter .2s ease;
+    }
+    .call-btn:hover { transform: translateY(-1px); filter: brightness(1.05); }
+    .call-btn:active { transform: translateY(0); filter: brightness(0.98); }
+    .call-btn.active {
+      background: radial-gradient(140% 100% at 0% 0%, var(--red2), var(--red1));
+      box-shadow: 0 10px 30px rgba(251,113,133,.35), inset 0 0 20px rgba(255,255,255,.05);
+    }
+
+    .card { background: rgba(17, 23, 53, .55); border: 1px solid var(--card-border);
+            border-radius: 14px; padding: 14px; backdrop-filter: blur(8px); }
+    .messages { margin-top: 16px; display: grid; gap: 10px; max-height: 48vh; overflow: auto; }
+    .msg { padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,.06);
+           box-shadow: 0 2px 10px rgba(0,0,0,.2); }
+    .user { background: rgba(17, 28, 63, .8); }
+    .assistant { background: rgba(11, 60, 49, .75); }
+    .hint { text-align: center; color: var(--muted); font-size: 12px; margin-top: 6px; }
+  </style>
+  <script>
+    // Basic downsampler Float32 48k -> Int16 16k mono (averaging)
+    function downsampleTo16k(float32Arr, inSampleRate) {
+      const outSampleRate = 16000;
+      const sampleRateRatio = inSampleRate / outSampleRate;
+      const newLength = Math.round(float32Arr.length / sampleRateRatio);
+      const result = new Int16Array(newLength);
+      let offsetResult = 0;
+      let offsetBuffer = 0;
+      while (offsetResult < result.length) {
+        const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+        let accum = 0, count = 0;
+        for (let i = offsetBuffer; i < nextOffsetBuffer && i < float32Arr.length; i++) {
+          accum += float32Arr[i];
+          count++;
+        }
+        const sample = Math.max(-1, Math.min(1, accum / (count || 1)));
+        result[offsetResult] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+        offsetResult++;
+        offsetBuffer = nextOffsetBuffer;
+      }
+      return result;
+    }
+
+    // Simple continuous PCM player using ScriptProcessor pull model
+    class PcmPlayer {
+      constructor(audioCtx) {
+        this.audioCtx = audioCtx;
+        this.queue = [];
+        this.readIndex = 0;
+        this.processor = audioCtx.createScriptProcessor(2048, 1, 1);
+        this.sourceSampleRate = 24000; // incoming PCM sample rate
+        this.processor.onaudioprocess = (e) => this._onAudioProcess(e);
+        this.processor.connect(audioCtx.destination);
+      }
+      // Enqueue base64 PCM16 24k
+      enqueueBase64Pcm16(base64Content, sampleRate = 24000) {
+        this.sourceSampleRate = sampleRate;
+        const binary = atob(base64Content);
+        const len = binary.length;
+        const buf = new ArrayBuffer(len);
+        const view = new Uint8Array(buf);
+        for (let i = 0; i < len; i++) view[i] = binary.charCodeAt(i);
+        const int16 = new Int16Array(buf);
+        const float32 = new Float32Array(int16.length);
+        for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+        // Resample to device rate if needed (linear)
+        const targetRate = this.audioCtx.sampleRate;
+        const resampled = this._resampleLinear(float32, sampleRate, targetRate);
+        this.queue.push(resampled);
+      }
+      _resampleLinear(samples, inRate, outRate) {
+        if (inRate === outRate) return samples;
+        const ratio = inRate / outRate;
+        const outLen = Math.floor(samples.length / ratio);
+        const out = new Float32Array(outLen);
+        for (let i = 0; i < outLen; i++) {
+          const pos = i * ratio;
+          const idx = Math.floor(pos);
+          const frac = pos - idx;
+          const s0 = samples[idx] || 0;
+          const s1 = samples[idx + 1] || s0;
+          out[i] = s0 + (s1 - s0) * frac;
+        }
+        return out;
+      }
+      _onAudioProcess(e) {
+        const out = e.outputBuffer.getChannelData(0);
+        let written = 0;
+        while (written < out.length) {
+          if (this.queue.length === 0) {
+            // underrun, fill with zeros
+            out.fill(0, written);
+            break;
+          }
+          const head = this.queue[0];
+          const remainingInHead = head.length - this.readIndex;
+          const needed = out.length - written;
+          const toCopy = Math.min(remainingInHead, needed);
+          out.set(head.subarray(this.readIndex, this.readIndex + toCopy), written);
+          written += toCopy;
+          this.readIndex += toCopy;
+          if (this.readIndex >= head.length) {
+            this.queue.shift();
+            this.readIndex = 0;
+          }
+        }
+      }
+    }
+
+    class NovaWebApp {
+      constructor() {
+        this.ws = null;
+        this.mediaStream = null;
+        this.processor = null;
+        this.audioCtx = null;
+        this.isStreaming = false;
+        this.inSampleRate = 48000; // most browsers
+        this.logEl = document.getElementById('log');
+        this.messagesEl = document.getElementById('messages');
+        this.callBtn = document.getElementById('callBtn');
+        this.pcmPlayer = null;
+      }
+
+      log(line) { if (!this.logEl) return; this.logEl.textContent += `\n${line}`; this.logEl.scrollTop = this.logEl.scrollHeight; }
+      addMsg(role, content) {
+        const div = document.createElement('div');
+        const cls = role === 'user' ? 'user' : 'assistant';
+        div.className = `msg ${cls}`;
+        const who = role === 'user' ? 'You' : 'Assistant';
+        div.textContent = `${who}: ${content}`;
+        this.messagesEl.appendChild(div);
+      }
+
+      async start() {
+        const host = (location.origin.replace('http', 'ws'));
+        this.ws = new WebSocket(`${host}/ws`);
+        this.ws.onopen = () => { this.log('WS connected'); };
+        this.ws.onclose = () => { this.log('WS closed'); };
+        this.ws.onerror = (e) => { this.log('WS error'); };
+        this.ws.onmessage = (ev) => {
+          if (typeof ev.data === 'string') {
+            try {
+              const msg = JSON.parse(ev.data);
+              if (msg.type === 'ready') this.log(`Ready. prompt=${msg.promptName}`);
+              if (msg.type === 'text') {
+                if (msg.role === 'assistant') {
+                  // Create live line on first assistant text if none exists
+                  let live = [...this.messagesEl.querySelectorAll('.msg.assistant')].reverse().find(d => d.dataset.live === '1');
+                  if (!live) {
+                    live = document.createElement('div');
+                    live.className = 'msg assistant';
+                    live.dataset.live = '1';
+                    live.textContent = 'Assistant: ';
+                    this.messagesEl.appendChild(live);
+                  }
+                  if (live) {
+                    // Append with spacing
+                    live.textContent = (live.textContent || 'Assistant: ') + (live.textContent.endsWith(' ') ? '' : ' ') + msg.content;
+                  } else {
+                    this.addMsg('assistant', msg.content);
+                  }
+                } else if (msg.role === 'user') {
+                  this.addMsg('user', msg.content);
+                }
+              }
+              if (msg.type === 'contentEnd' && msg.role === 'ASSISTANT') {
+                // Mark the latest live line as finalized
+                const live = [...this.messagesEl.querySelectorAll('.msg.assistant')].reverse().find(d => d.dataset.live === '1');
+                if (live) delete live.dataset.live;
+              }
+              if (msg.type === 'audio' && this.pcmPlayer) this.pcmPlayer.enqueueBase64Pcm16(msg.content, msg.sampleRate || 24000);
+            } catch {}
+          }
+        };
+
+        await new Promise((resolve) => { this.ws.addEventListener('open', resolve, { once: true }); });
+
+        // Mic setup
+        this.audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: this.inSampleRate });
+        this.pcmPlayer = new PcmPlayer(this.audioCtx);
+        this.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+        const source = this.audioCtx.createMediaStreamSource(this.mediaStream);
+        // 1024 @ 48k ≈ ~21ms frames for steady cadence
+        const processor = this.audioCtx.createScriptProcessor(1024, 1, 1);
+        this.processor = processor;
+        const self = this;
+        processor.onaudioprocess = function (e) {
+          if (!self.isStreaming) return;
+          const input = e.inputBuffer.getChannelData(0);
+          const int16 = downsampleTo16k(input, self.inSampleRate);
+          // backpressure guard to avoid spikes
+          if (self.ws.bufferedAmount < 1_000_000) {
+            self.ws.send(int16.buffer);
+          }
+        };
+        source.connect(processor);
+        processor.connect(this.audioCtx.destination);
+
+        // Begin a turn
+        this.ws.send(JSON.stringify({ type: 'beginAudio' }));
+        this.isStreaming = true;
+        if (this.callBtn) { this.callBtn.classList.add('active'); this.callBtn.textContent = 'End Call'; }
+      }
+
+      async stop() {
+        if (this.ws && this.isStreaming) {
+          this.ws.send(JSON.stringify({ type: 'endAudio' }));
+          this.isStreaming = false;
+        }
+        try { this.processor && this.processor.disconnect(); } catch {}
+        try { this.mediaStream && this.mediaStream.getTracks().forEach(t => t.stop()); } catch {}
+        if (this.callBtn) { this.callBtn.classList.remove('active'); this.callBtn.textContent = 'Call Agent'; }
+      }
+    }
+
+    let appInstance;
+    window.addEventListener('DOMContentLoaded', () => {
+      appInstance = new NovaWebApp();
+      const toggle = async () => {
+        if (!appInstance.isStreaming) {
+          await appInstance.start();
+        } else {
+          await appInstance.stop();
+        }
+      };
+      document.getElementById('callBtn').onclick = () => { toggle(); };
+    });
+  </script>
+</head>
+<body>
+  <div class="shell">
+    <div class="hero">
+      <div class="title">TechCorp Reception · Nova Voice</div>
+      <button id="callBtn" class="call-btn">Call Agent</button>
+      <div class="hint">Click to start a real-time voice call with the agent</div>
+    </div>
+    <div class="card">
+      <div id="messages" class="messages"></div>
+    </div>
+  </div>
+</body>
+</html>
+
+
