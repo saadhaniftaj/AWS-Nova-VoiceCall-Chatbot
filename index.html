@@ -45,6 +45,39 @@
     .user { background: rgba(17, 28, 63, .8); }
     .assistant { background: rgba(11, 60, 49, .75); }
     .hint { text-align: center; color: var(--muted); font-size: 12px; margin-top: 6px; }
+    
+    .edit-btn, .save-btn, .cancel-btn {
+      appearance: none; border: 0; cursor: pointer; font-weight: 600; padding: 8px 16px;
+      border-radius: 6px; font-size: 12px; transition: all .2s ease;
+    }
+    .edit-btn { background: var(--blue1); color: white; }
+    .edit-btn:hover { background: var(--blue2); }
+    .save-btn { background: #10b981; color: white; margin-right: 8px; }
+    .save-btn:hover { background: #059669; }
+    .cancel-btn { background: #6b7280; color: white; }
+    .cancel-btn:hover { background: #4b5563; }
+    
+    .prompt-display {
+      background: rgba(0,0,0,.3); border: 1px solid rgba(255,255,255,.1);
+      border-radius: 8px; padding: 12px; font-family: 'Courier New', monospace;
+      font-size: 13px; line-height: 1.4; white-space: pre-wrap;
+      max-height: 200px; overflow-y: auto; color: var(--muted);
+    }
+    
+    .prompt-editor {
+      width: 100%; background: rgba(0,0,0,.4); border: 1px solid rgba(255,255,255,.2);
+      border-radius: 8px; padding: 12px; font-family: 'Courier New', monospace;
+      font-size: 13px; line-height: 1.4; color: var(--text); resize: vertical;
+      min-height: 300px;
+    }
+    .prompt-editor:focus { outline: none; border-color: var(--blue2); }
+    
+    .prompt-status {
+      margin-top: 8px; padding: 8px; border-radius: 6px; font-size: 12px;
+      text-align: center; display: none;
+    }
+    .prompt-status.success { background: rgba(16, 185, 129, .2); color: #10b981; }
+    .prompt-status.error { background: rgba(239, 68, 68, .2); color: #ef4444; }
   </style>
   <script>
     // Basic downsampler Float32 48k -> Int16 16k mono (averaging)
@@ -148,6 +181,17 @@
         this.messagesEl = document.getElementById('messages');
         this.callBtn = document.getElementById('callBtn');
         this.pcmPlayer = null;
+        
+        // Prompt editor elements
+        this.promptDisplay = document.getElementById('promptDisplay');
+        this.promptEditor = document.getElementById('promptEditor');
+        this.editPromptBtn = document.getElementById('editPromptBtn');
+        this.savePromptBtn = document.getElementById('savePromptBtn');
+        this.cancelPromptBtn = document.getElementById('cancelPromptBtn');
+        this.promptStatus = document.getElementById('promptStatus');
+        this.originalPrompt = '';
+        
+        this.initPromptEditor();
       }
 
       log(line) { if (!this.logEl) return; this.logEl.textContent += `\n${line}`; this.logEl.scrollTop = this.logEl.scrollHeight; }
@@ -158,6 +202,88 @@
         const who = role === 'user' ? 'You' : 'Assistant';
         div.textContent = `${who}: ${content}`;
         this.messagesEl.appendChild(div);
+      }
+
+      async initPromptEditor() {
+        // Load current prompt
+        await this.loadCurrentPrompt();
+        
+        // Set up event listeners
+        this.editPromptBtn.onclick = () => this.startEditing();
+        this.savePromptBtn.onclick = () => this.savePrompt();
+        this.cancelPromptBtn.onclick = () => this.cancelEditing();
+      }
+
+      async loadCurrentPrompt() {
+        try {
+          const response = await fetch('/api/system-prompt');
+          const data = await response.json();
+          this.originalPrompt = data.prompt;
+          this.promptDisplay.textContent = data.prompt;
+        } catch (error) {
+          this.showStatus('Failed to load system prompt', 'error');
+        }
+      }
+
+      startEditing() {
+        this.promptEditor.value = this.originalPrompt;
+        this.promptDisplay.style.display = 'none';
+        this.promptEditor.style.display = 'block';
+        this.editPromptBtn.style.display = 'none';
+        this.savePromptBtn.style.display = 'inline-block';
+        this.cancelPromptBtn.style.display = 'inline-block';
+        this.promptEditor.focus();
+      }
+
+      cancelEditing() {
+        this.promptDisplay.style.display = 'block';
+        this.promptEditor.style.display = 'none';
+        this.editPromptBtn.style.display = 'inline-block';
+        this.savePromptBtn.style.display = 'none';
+        this.cancelPromptBtn.style.display = 'none';
+        this.hideStatus();
+      }
+
+      async savePrompt() {
+        const newPrompt = this.promptEditor.value.trim();
+        if (!newPrompt) {
+          this.showStatus('Prompt cannot be empty', 'error');
+          return;
+        }
+
+        try {
+          const response = await fetch('/api/system-prompt', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt: newPrompt })
+          });
+
+          if (response.ok) {
+            this.originalPrompt = newPrompt;
+            this.promptDisplay.textContent = newPrompt;
+            this.cancelEditing();
+            this.showStatus('System prompt updated successfully! Restart your call to use the new agent.', 'success');
+          } else {
+            const error = await response.json();
+            this.showStatus(error.detail || 'Failed to update prompt', 'error');
+          }
+        } catch (error) {
+          this.showStatus('Failed to update prompt', 'error');
+        }
+      }
+
+      showStatus(message, type) {
+        this.promptStatus.textContent = message;
+        this.promptStatus.className = `prompt-status ${type}`;
+        this.promptStatus.style.display = 'block';
+        
+        if (type === 'success') {
+          setTimeout(() => this.hideStatus(), 5000);
+        }
+      }
+
+      hideStatus() {
+        this.promptStatus.style.display = 'none';
       }
 
       async start() {
@@ -171,6 +297,10 @@
             try {
               const msg = JSON.parse(ev.data);
               if (msg.type === 'ready') this.log(`Ready. prompt=${msg.promptName}`);
+              if (msg.type === 'prompt_updated') {
+                this.showStatus(msg.message, 'success');
+                this.loadCurrentPrompt(); // Refresh the display
+              }
               if (msg.type === 'text') {
                 if (msg.role === 'assistant') {
                   // Create live line on first assistant text if none exists
@@ -263,11 +393,25 @@
       <button id="callBtn" class="call-btn">Call Agent</button>
       <div class="hint">Click to start a real-time voice call with the agent</div>
     </div>
+    
+    <!-- System Prompt Editor -->
+    <div class="card" id="promptCard">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+        <h3 style="margin: 0; color: var(--text);">System Prompt</h3>
+        <div>
+          <button id="editPromptBtn" class="edit-btn">Edit</button>
+          <button id="savePromptBtn" class="save-btn" style="display: none;">Save</button>
+          <button id="cancelPromptBtn" class="cancel-btn" style="display: none;">Cancel</button>
+        </div>
+      </div>
+      <div id="promptDisplay" class="prompt-display"></div>
+      <textarea id="promptEditor" class="prompt-editor" style="display: none;" rows="15"></textarea>
+      <div id="promptStatus" class="prompt-status"></div>
+    </div>
+    
     <div class="card">
       <div id="messages" class="messages"></div>
     </div>
   </div>
 </body>
 </html>
-
-
