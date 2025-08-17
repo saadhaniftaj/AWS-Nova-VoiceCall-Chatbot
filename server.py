@@ -88,7 +88,7 @@ class NovaSession:
                             "sampleRateHertz": 24000,
                             "sampleSizeBits": 16,
                             "channelCount": 1,
-                            "voiceId": "matthew",
+                            "voiceId": "Nova",
                             "encoding": "base64",
                             "audioType": "SPEECH",
                         },
